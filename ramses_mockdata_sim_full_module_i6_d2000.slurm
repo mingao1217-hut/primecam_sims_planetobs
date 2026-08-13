@@ -1,0 +1,141 @@
+#!/bin/bash
+
+################################################
+###     SLURM script for primecam_sims      ####
+###  2000-det, full 3-array module, I6-      ####
+###  translated focal plane, Ben's 5deg/     ####
+###  +4min schedule, scan_rate_az=0.5 deg/s   ####
+###					                        ####
+###     Tested on Uni Koeln Ramses Cluster  ####
+###             v1.0 , 08.13.2026           ####
+################################################
+###
+### NOT YET SUBMITTED -- prepared per stage 9 of the Ankur/Ben full-module
+### validation, pending review. The stage-7/8 10-det trajectory-only run
+### against this same schedule/geometry showed strong coverage across all
+### three wafers (overall: median dmin=0.30', 98.6% of all 10,308 truth
+### detectors within 1 FWHM; per-wafer: w1=96.7%, w2=100.0%, w3=99.2%),
+### so this is the next step up: an actual multi-detector timestream run
+### (not just boresight trajectory), still atmosphere/noise off for a
+### clean pointing-only check, before considering a full 10,308-det run.
+###
+### ndets=2000 is a mid-range pick within the requested 1000-3000 window --
+### easy to change in section 4 before submitting.
+###
+### Same geometry/schedule/tube handling as the stage-7 run:
+###   - MODULE_ARRAYS=3 + --fp-source fp_f280_dettable_I6.h5 (Ben's
+###     validated I6 hardware translation baked into the focalplane file)
+###     -- NOT --tube-xi-off-deg/--tube-eta-off-deg, which would double
+###     apply the offset.
+###   - schedule_Jupiter_5_0deg_plus4min.txt (Ben's current wider Jupiter
+###     schedule, unmodified/untuned).
+###   - --scan-rate-az-deg-per-s 0.5.
+###   - atmosphere/noise left off (defaults).
+###
+### --run-tag full_module_i6_d2000 keeps this in its own output directory,
+### separate from the stage-7 10-det run.
+
+### section 1 - SLURM params
+
+#SBATCH --partition=smp
+#SBATCH --account=ag-riechers # For Ramses/ CCAT
+
+#SBATCH --ntasks-per-node 12
+#SBATCH --cpus-per-task 1
+
+#SBATCH --nodes 1
+
+#SBATCH --job-name=mgao_jup_fullmod_i6_d2000
+
+#SBATCH --mem=200G
+### Maximum requested time (days-hrs:min:sec)
+#SBATCH --time 0-02:00:00
+
+#SBATCH --output ./logs_sims/%A_%a_%x.out
+#SBATCH --error ./logs_sims/%A_%a_%x.err
+### To handle dir ownership issues
+umask 0002
+mkdir -p logs_sims
+chmod g+rws logs_sims
+
+### section 2 - Runtime env set-up
+echo ""
+echo "*************"
+echo "Loading Modules and Env..."
+module purge
+### load all modules needed for Job
+module load lib/mpi4py/3.1.5-gompi-2023b
+module load lang/Miniconda3/23.9.0-0
+### initiate conda
+conda deactivate
+conda activate toast3
+echo "*************"
+
+### section 3 - Job Logging
+echo ""
+echo "*************"
+echo "Running Job..."
+echo "Starting at `date`"
+echo "Hostname $HOSTNAME"
+echo "Job Name: $SLURM_JOB_NAME"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node List: $SLURM_NODELIST"
+echo "Running on $SLURM_NNODES nodes."
+echo "Running on $SLURM_NPROCS processors."
+echo "Slurm Ntasks: $SLURM_NTASKS"
+echo "Number of Tasks per Node: $SLURM_NTASKS_PER_NODE"
+echo "Number of CPUs per Task: $SLURM_CPUS_PER_TASK"
+echo "Cores per Node: $SLURM_CPUS_ON_NODE"
+echo "Total Number of Nodes: $SLURM_JOB_NUM_NODES"
+echo "Current working directory is `pwd`"
+echo "Python path: $(which python)"
+echo "Using MPI lib: $(which mpirun)"
+echo "mpi4py import version: $(python -c 'import mpi4py; print(mpi4py.__version__)')"
+echo "Using GCC lib: $(which gcc)"
+echo ""
+
+### section 4 - Set Job parameters
+### Set number of detectors -- mid-range pick within the requested
+### 1000-3000 window; change here if a different size is wanted.
+ndets=2000
+### Full 3-array module
+MODULE_ARRAYS=3
+### Already-translated (tube I6) full-module focal plane
+FP_SOURCE=fp_f280_dettable_I6.h5
+
+### section 5 - Job Run
+echo "***** EXEC SCRIPT *****"
+echo `date '+%F %H:%M:%S'`
+echo "***********************"
+echo ""
+
+schedule_file="schedule_Jupiter_5_0deg_plus4min.txt"
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+echo ""
+echo "Running schedule file: $schedule_file"
+echo "Number of dets: $ndets"
+echo "Module arrays: $MODULE_ARRAYS"
+echo "FP source: $FP_SOURCE"
+echo "Scan rate: 0.5 deg/s"
+echo ""
+
+### Making detector files
+python -m scripts.fp_scripts.fp_trim $ndets --module-arrays $MODULE_ARRAYS --fp-source $FP_SOURCE
+if [ $? -ne 0 ]; then
+    echo "Error occurred in FP file generation script. Exiting."
+    exit 1
+fi
+
+### Simulating timestream data: full module, I6-translated focal plane
+### baked in via --fp-source (no --tube-xi-off-deg/--tube-eta-off-deg here),
+### 0.5 deg/s scan rate, atmosphere/noise off (defaults).
+mpirun -np $SLURM_NTASKS python3 sim_data_primecam_mpi.py \
+    -s $schedule_file -d $ndets --module-arrays $MODULE_ARRAYS \
+    --fp-source $FP_SOURCE --run-tag full_module_i6_d2000 \
+    --scan-rate-az-deg-per-s 0.5
+
+echo ""
+echo "******** DONE *********"
+echo `date '+%F %H:%M:%S'`
+echo "***********************"
