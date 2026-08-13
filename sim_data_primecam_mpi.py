@@ -32,6 +32,7 @@
 #04-02-2025: Updated gains for atm sim
 #21-09-2025: Updated all dets to correct for NET values
 #21-09-2025: Updated gains for atm sim
+#13-08-2026: Updated fp_trim and mockdata_pipeline to include full module selection
 ###
 
 """
@@ -55,7 +56,9 @@ import toast.io as io
 import toast.ops
 from toast.mpi import MPI
 from scripts.helper_scripts.calc_groupsize import job_group_size, estimate_group_size
+from scripts.fp_scripts import fp_trim
 from scripts.sso_scripts.sim_sso import SimSSO
+from tube_offset import apply_tube_offset
 
 import astropy.units as u
 from astropy.table import QTable, Column
@@ -73,12 +76,12 @@ class Args:
     def __init__(self, parsed_args):   
         # Keep input sky map False for planet sims; planet done by SSO
         self.scan_inmap = False #False Default # Toggle to Scan Input Sky Map
-        self.sim_atm = True #True Default # Toggle to Simulate Atmosphere
-        self.sim_noise = True #True Default # Toggle to Simulate Detector Noise
+        self.sim_atm = parsed_args.sim_atm # Toggle to Simulate Atmosphere
+        self.sim_noise = parsed_args.sim_noise # Toggle to Simulate Detector Noise
 
         self.weather = 'atacama'
         self.sample_rate = 488 * u.Hz #488 Hz # or 244 Hz
-        self.scan_rate_az = 0.2  * (u.deg / u.s) #on sky rate , or 1 deg/s
+        self.scan_rate_az = parsed_args.scan_rate_az_deg_per_s * (u.deg / u.s) #on sky rate , or 1 deg/s
         #fix_rate_on_sky (bool):  If True, `scan_rate_az` is given in sky coordinates and azimuthal
         #rate on mount will be adjusted to meet it.
         #If False, `scan_rate_az` is used as the mount azimuthal rate. (default = True)
@@ -86,10 +89,20 @@ class Args:
         self.scan_accel_az = 1  * (u.deg / u.s**2) # or 4 deg/s^2
         self.fov = 1.3 * u.deg # Field-of-view in degrees
         # g3_outdir = "./g3_dataframes"
+        # Suffix so a noise/atmosphere run, or a run with a different
+        # schedule/duration, never lands in the same directory as an
+        # existing run for the same detector count and silently overwrites
+        # it. --run-tag lets the caller (slurm script) disambiguate
+        # explicitly for any future variation, not just noise vs clean.
+        dataset_suffix = ""
+        if parsed_args.sim_atm or parsed_args.sim_noise:
+            dataset_suffix += "_noise"
+        if parsed_args.run_tag:
+            dataset_suffix += f"_{parsed_args.run_tag}"
         self.h5_outdir = os.path.join(
-            ".", "ccat_datacenter_mock", 
-            "mockdata", 
-            f"planet_ATMdata_d{parsed_args.dets}"
+            ".", "ccat_datacenter_mock",
+            "mockdata",
+            f"planet_ATMdata_d{parsed_args.dets}{dataset_suffix}"
         )
         
         self.mode = "IQU" #"IQU"
@@ -337,11 +350,50 @@ def main():
             The schedule file must be in the 'input_files/schedules' directory.")
     # Required argument for the schedule file
     parser.add_argument('-s','--sch', required=True, help="Name of the schedule file")
-    parser.add_argument('-d', '--dets', 
-                        type=int, 
-                        default=100, 
-                        help="Number of detectors")
+    parser.add_argument('-d', '--dets',
+                        default="100",
+                        help="Number of detectors, or FULL for no trimming")
+    parser.add_argument('--module-arrays', '--MODULE_ARRAYS',
+                        dest='MODULE_ARRAYS',
+                        type=int,
+                        default=int(os.environ.get("MODULE_ARRAYS", 1)),
+                        choices=[1, 3],
+                        help="Module arrays to use: 1 selects w2, 3 selects w1/w2/w3 detectors")
+    parser.add_argument('--fp-source', dest='fp_source', default="fp_f280_dettable.h5",
+                        help="Full detector-table h5 file (inside input_files/fp_files/) to "
+                             "trim ndets/module-arrays from (default: fp_f280_dettable.h5). "
+                             "Pass fp_f280_dettable_I6.h5 to build the sim's focalplane from "
+                             "an already hardware-translated (Ben's I6 tube offset) full-module "
+                             "file, instead of applying --tube-xi-off-deg/--tube-eta-off-deg "
+                             "at runtime -- do not combine the two for the same run, or the "
+                             "offset would be applied twice.")
     parser.add_argument('-g','--grp_size', default=None, type=int, help="Group size (optional)")
+    parser.add_argument('--sim-atm', action='store_true',
+                        help="Simulate atmosphere (default: off, clean sim for pointing tests)")
+    parser.add_argument('--sim-noise', action='store_true',
+                        help="Simulate detector noise (default: off, clean sim for pointing tests)")
+    parser.add_argument('--run-tag', default="",
+                        help="Extra tag appended to the output dataset directory name, "
+                             "to keep runs that differ only by schedule/duration/etc. "
+                             "from colliding with an existing directory (default: none)")
+    parser.add_argument('--tube-xi-off-deg', type=float, default=0.0,
+                        help="Fixed hardware xi offset for this optics tube, degrees "
+                             "(default: 0.0, no change from existing focalplane geometry). "
+                             "Applied uniformly to every detector's quaternion via "
+                             "tube_offset.apply_tube_offset -- NOT the same thing as "
+                             "aux/params_gen_yaml_planets.py's --xi-off-deg, which shifts "
+                             "scan pointing, not hardware geometry.")
+    parser.add_argument('--tube-eta-off-deg', type=float, default=0.0,
+                        help="Fixed hardware eta offset for this optics tube, degrees. "
+                             "See --tube-xi-off-deg.")
+    parser.add_argument('--scan-rate-az-deg-per-s', type=float, default=0.2,
+                        help="Boresight azimuth scan rate, on-sky, deg/s (default: 0.2, "
+                             "the value hardcoded here for the whole session prior to this "
+                             "flag -- unchanged unless explicitly passed). Note this is "
+                             "independent of any scan-speed assumption baked into an "
+                             "externally-generated schedule's own Az/El/duration numbers "
+                             "-- the schedule text format carries no speed field, so this "
+                             "flag is the only thing that controls replay speed here.")
 
     parsed_args = parser.parse_args()
     
@@ -356,13 +408,33 @@ def main():
 
     # Initialize the communicator
     comm, procs, rank = toast.get_world()
-    
+
+    # Focalplane file preparation
+    # Rank 0 prepares the focalplane file once; other ranks wait and reuse it.
+    if rank == 0:
+        ndets_selected, fp_filename = fp_trim.build_fp_file(
+            parsed_args.dets,
+            module_arrays=parsed_args.MODULE_ARRAYS,
+            source_filename=parsed_args.fp_source,
+        )
+    else:
+        ndets_selected, fp_filename = None, None
+
+    if comm is not None:
+        ndets_selected = comm.bcast(ndets_selected, root=0)
+        fp_filename = comm.bcast(fp_filename, root=0)
+        comm.barrier()
+
+    # Keep detector count consistent with the exact focalplane file used.
+    parsed_args.dets = ndets_selected
+    args = Args(parsed_args)
+
     # Initialize the TOAST logger
     if "OMP_NUM_THREADS" in os.environ:
         nthread = os.environ["OMP_NUM_THREADS"]
     else:
         nthread = "unknown number of"
-        
+
     log_global.info_rank(
         f"Executing PrimeCam workflow with {procs} MPI tasks, each with "
         f"{nthread} OpenMP threads at {datetime.now()}",
@@ -373,29 +445,49 @@ def main():
         f"Using TOAST version: {toast.__version__}", comm)
 
     log_global.info_rank(
+        f"Using {parsed_args.MODULE_ARRAYS} module array(s) with {parsed_args.dets} detectors "
+        f"from source {parsed_args.fp_source}",
+        comm,
+    )
+
+    log_global.info_rank(
         f"Starting timesteam simulation...", comm)
     if rank == 0:
         sim_start_time = t.time()
 
     mem = toast.utils.memreport(msg="(whole node)", comm=comm, silent=True)
     log_global.info_rank(f"Start of the workflow:  {mem}", comm)
-    
+
     log_global.info_rank(
         f"Begin set-up and monitors for Simulating timestream data for PrimeCam/FYST",
         comm)
 
-    # Focalplane file
+    # Load the rank-synchronized focalplane file.
     try:
-        focalplane_file = f"dets_FP_PC280_{parsed_args.dets}_w2.h5"  
-        fp_filename = os.path.join("input_files/fp_files", focalplane_file)
         det_table = QTable.read(fp_filename, path='dettable_trim')
     except Exception as e:
         log_global.error(f"Failed to load focalplane file: {fp_filename}. Error: {e}", comm)
-        raise  
-    
+        raise
+
     log_global.info_rank(f"Loading focalplane: {fp_filename}", comm)
-    
-    # instantiate a TOAST focalplane instance 
+
+    # Fixed hardware tube offset (Ben's optics-tube xi_off/eta_off) -- applied
+    # uniformly to every detector's quaternion, on top of whatever relative
+    # within-tube layout is already in det_table. No-op when both are 0.0
+    # (the default), so this doesn't touch behavior for any existing run.
+    if parsed_args.tube_xi_off_deg != 0.0 or parsed_args.tube_eta_off_deg != 0.0:
+        log_global.info_rank(
+            f"Applying tube offset xi_off={parsed_args.tube_xi_off_deg} deg, "
+            f"eta_off={parsed_args.tube_eta_off_deg} deg to all detector quaternions",
+            comm,
+        )
+        det_table["quat"] = apply_tube_offset(
+            np.asarray(det_table["quat"], dtype=float),
+            parsed_args.tube_xi_off_deg,
+            parsed_args.tube_eta_off_deg,
+        )
+
+    # instantiate a TOAST focalplane instance
     width = args.fov
     focalplane = toast.instrument.Focalplane(
         detector_data=det_table,
